@@ -1,3 +1,8 @@
+20201128 updates:
+
+    I want to duplicate the yolo algorithm based on my own ideas, and structed prune yolo use pytorch, if you agree with my work, thank u to give me a star to support
+
+
 voc datasets:
 
                         map
