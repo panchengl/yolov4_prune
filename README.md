@@ -14,11 +14,21 @@ voc datasets:
         u can easily obtain this performance
 
 
-how to train:
 
-    train command:
+how to train your own dataset:
 
-        python -m torch.distributed.launch --nproc_per_node 4 train_mutil_gpu.py --cfg cfg/yolov4.cfg --weights weights/yolov4.weights --device 0,1,2,3 --train_path data/train.txt --val_path data/val.txt --names_classes data/coco.names
+1. create dataset, make your dataset become txt file- just like this:
+
+    img_id img_dir width height label xmin ymin xmax ymax
+    1 dir/img1.jpg width height label1 xmin ymin xmax ymax label2 xmin ymin xmax ymax .......
+    2 dir/img2.jpg width height label1 xmin ymin xmax ymax .......
+
+2.create label.names just like data/voc.names in my code
+
+
+3.train command:
+
+        python train.py --cfg cfg/yolov4.cfg --weights weights/yolov4.weights --device 0,1,2,3 --train_path data/train.txt --val_path data/val.txt --names_classes data/coco.names
 
 
 # yolov4_prune
