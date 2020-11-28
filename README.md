@@ -20,8 +20,10 @@ how to train your own dataset:
 1. create dataset, make your dataset become txt file- just like this:
 
     img_id img_dir width height label xmin ymin xmax ymax
+
     1 dir/img1.jpg width height label1 xmin ymin xmax ymax label2 xmin ymin xmax ymax .......
-    2 dir/img2.jpg width height label1 xmin ymin xmax ymax .......
+
+    2 dir/img2.jpg width height label1 xmin ymin xmax ymax
 
 2.create label.names just like data/voc.names in my code
 
