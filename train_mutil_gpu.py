@@ -382,7 +382,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_path', type=str, default='data/train2017_txt_dataset.txt', help='*.data path')
     parser.add_argument('--val_path', type=str, default='data/val2017_txt_dataset.txt', help='*.data path')
     parser.add_argument('--names_classes', type=str, default='data/coco.names', help='*.data path')
-    parser.add_argument('--multi_scale', default='True', help='adjust (67%% - 150%%) img_size every 10 batches')
+    parser.add_argument('--multi_scale', default=True, help='adjust (67%% - 150%%) img_size every 10 batches')
     parser.add_argument('--weights', type=str, default='weights/yolov4.weights', help='initial weights path')
     parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
 

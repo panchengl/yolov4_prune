@@ -11,6 +11,8 @@ from utils.util import *
 from utils.torch_utils import select_device
 from utils.dataset import create_dataloader
 mixed_precision = True
+
+from utils.prune_utils import parse_module_defs
 try:  # Mixed precision training https://github.com/NVIDIA/apex
     from apex import amp
 except:
@@ -18,8 +20,8 @@ except:
     mixed_precision = False  # not installed
 
 wdir = 'weights' + os.sep  # weights dir
-last = wdir + 'last.pt'
-best = wdir + 'best.pt'
+last = wdir + 'last_voc.pt'
+best = wdir + 'best_voc.pt'
 results_file = 'results.txt'
 
 # Hyperparameters
@@ -74,6 +76,7 @@ def train(hyp):
 
     # Initialize model
     model = Darknet(opt.cfg, opt.input_size, opt.algorithm_type).to(device)
+    CBL_idx, _, prune_idx, ignore_idx = parse_module_defs(model.module_defs)
     # Optimizer
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in dict(model.named_parameters()).items():
@@ -164,15 +167,7 @@ def train(hyp):
     # plt.tight_layout()
     # plt.savefig('LR.png', dpi=300)
 
-    # Initialize distributed training
-    # if device.type != 'cpu' and torch.cuda.device_count() > 1 and torch.distributed.is_available():
-    #     dist.init_process_group(backend='nccl',  # 'distributed backend'
-    #                             init_method='tcp://127.0.0.1:9995',  # distributed training init method
-    #                             world_size=1,  # number of nodes for distributed training
-    #                             rank=0)  # distributed training node rank
-    #     model = torch.nn.parallel.DistributedDataParallel(model)
     model = torch.nn.DataParallel(model).to(device)
-    # model.module_list = model.module.module_list
     model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
     dataloader, dataset = create_dataloader(opt.train_path, opt.input_size, batch_size, gs, hyp=hyp,
                                            augment=True,
@@ -249,6 +244,11 @@ def train(hyp):
             else:
                 loss.backward()
             # Optimize
+            idx2mask = None
+            # if opt.sr and opt.prune==1 and epoch > opt.epochs * 0.5:
+            #     idx2mask = get_mask2(model, prune_idx, 0.85)
+            from utils.prune_utils import BNOptimizer
+            BNOptimizer.updateBN(opt.sr_flag, model.module_list, opt.gamma, prune_idx, idx2mask)
             if ni % accumulate == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -350,14 +350,16 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=8)  # effective bs = batch_size * accumulate = 16 * 4 = 64
     parser.add_argument('--input_size', nargs='+', type=int, default=608, help='[min_train, max-train, test]')
     parser.add_argument('--algorithm_type', default="v4", help='algorithm_type yolov3 v4 v5')
-    parser.add_argument('--device', default='4,5', help='device id (i.e. 0 or 0,1 or cpu)')
+    parser.add_argument('--device', default='0,1', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--cfg', type=str, default='cfg/yolov4.cfg', help='*.cfg path')
     parser.add_argument('--train_path', type=str, default='data/train2017_txt_dataset.txt', help='*.data path')
     parser.add_argument('--val_path', type=str, default='data/val2017_txt_dataset.txt', help='*.data path')
     parser.add_argument('--names_classes', type=str, default='data/coco.names', help='*.data path')
-    parser.add_argument('--multi_scale', default= True, help='adjust (67%% - 150%%) img_size every 10 batches')
+    parser.add_argument('--multi_scale', default=True, help='adjust (67%% - 150%%) img_size every 10 batches')
     parser.add_argument('--weights', type=str, default='weights/yolov4.weights', help='initial weights path')
     parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
+    parser.add_argument('--sr_flag', default=True, help='prune flag')
+    parser.add_argument('--gamma', type=float, default=1e-4, help='prune flag')
 
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
