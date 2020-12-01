@@ -192,10 +192,17 @@ class YOLOLayer(nn.Module):
             # print("self.grid is", self.grid.shape)
             # print("torch.sigmoid(pred_result[..., :2]) is",torch.sigmoid(pred_result[..., :2]).shape )
             # print("torch.sigmoid(pred_result[..., :2])  is",torch.sigmoid(pred_result[..., :2]) )
+            ## yolov3 yolo layer
             pred_result[..., :2] = torch.sigmoid(pred_result[..., :2]) + self.grid    #  [batch_size, num_anchors, grid_x, grid_szie, 2(x,y)] + [grid_x, grid_y, 2(grid_x_loc + grid_y_loc)]
+            # pred_result[..., 2:4] = torch.exp(pred_result[..., 2:4]) * self.anchor_wh #  exp([batch_size, num_anchors, grid_x, grid_szie, 2(w,h)]) * ori_w_h/stride.reshape->[1, num_anchors, grid_x, grid_y, 2(anchor_w_h)]
             pred_result[..., 2:4] = torch.exp(pred_result[..., 2:4]) * self.anchor_wh #  exp([batch_size, num_anchors, grid_x, grid_szie, 2(w,h)]) * ori_w_h/stride.reshape->[1, num_anchors, grid_x, grid_y, 2(anchor_w_h)]
             pred_result[..., :4] *= self.stride                                       # feature_map x,y,w,h -> ori x,y,w,h
             torch.sigmoid_(pred_result[..., 4:])                                      # sigmod(conf_and_class_prob)
+            ## yolov4 or yolov5 yolo layer
+            # y = pred_result.sigmoid()
+            # y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid.to(pred_result.device)) * self.stride  # xy
+            # y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_wh  # wh
+
             return pred_result.view(batch_size, -1, self.num_classes+5)  , pred             # [batch_size, grid_size*grid_size*3, num_classes+5]   reshape from [1, 3, 13, 13, 85] to [1, 507, 85]
 
 
