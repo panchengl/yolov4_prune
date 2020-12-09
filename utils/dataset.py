@@ -466,8 +466,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 x[img] = None
                 print('WARNING: %s: %s' % (img, e))
         # x['hash'] = get_hash(self.label_files + self.img_files)
-        print("path is", path)
-        torch.save(x, path)  # save for next time
+        # print("path is", path)
+        # torch.save(x, path)  # save for next time
         return x
 
     def cache_labels(self, path='labels.cache'):
@@ -918,7 +918,7 @@ def create_folder(path='./new'):
 
 if __name__ == "__main__":
     import torchvision
-    import args as args
+    # import args as args
 
     hyp = {'optimizer': 'SGD',  # ['adam', 'SGD', None] if none, default is SGD
            'lr0': 0.01,  # initial learning rate (SGD=1E-2, Adam=1E-3)
@@ -940,8 +940,10 @@ if __name__ == "__main__":
            'scale': 0.5,  # image scale (+/- gain)
            'shear': 0.0}  # image shear (+/- deg)
 
-
-    dataloader, dataset = create_dataloader(args.train_path, args.input_size, args.batch_size, 32, hyp=hyp,
+    train_path = "/home/pcl/pytorch_work/my_github/yolov3_pcl/yolov4_pcl/data/train.txt"
+    input_size = 608
+    batch_size = 3
+    dataloader, dataset = create_dataloader(train_path, input_size, batch_size, 32, hyp=hyp,
                                             augment=True,
                                             cache=False, rect=False, local_rank=-1,
                                             world_size=1)
@@ -953,7 +955,7 @@ if __name__ == "__main__":
         print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
         pbar = tqdm(pbar, total=nb)  # progress bar
     for i, (imgs, targets, paths, _) in enumerate(tqdm(dataloader)):  # batch -------------------------------------------------------------
-        # print("imgs is", imgs)
-        # print("targets is", targets)
+        print("imgs is", imgs.shape)
+        print("targets is", targets.shape)
         print("path is", paths)
 

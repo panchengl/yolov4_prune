@@ -5,11 +5,13 @@
 
 voc datasets:
 
-                        map
+                        map                        size
 
-            yolov4      0.87(after 3 epoch)
+            yolov4      0.87(after 3 epoch)        240Mb
 
-            yolov3      0.83(after 10 epoch)
+            yolov3      0.83(after 10 epoch)       240Mb
+
+      yolov4_prune      0.832                       75Mb
 
         u can easily obtain this performance
 

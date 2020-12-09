@@ -10,6 +10,7 @@ from model import *
 from utils.util import *
 from utils.torch_utils import select_device
 from utils.dataset import create_dataloader
+from utils.prune_utils import BNOptimizer, gather_bn_weights
 mixed_precision = True
 
 from utils.prune_utils import parse_module_defs
@@ -20,8 +21,8 @@ except:
     mixed_precision = False  # not installed
 
 wdir = 'weights' + os.sep  # weights dir
-last = wdir + 'last_voc.pt'
-best = wdir + 'best_voc.pt'
+last = wdir + 'last_voc_slim.pt'
+best = wdir + 'best_voc_slim.pt'
 results_file = 'results.txt'
 
 # Hyperparameters
@@ -118,6 +119,7 @@ def train(hyp):
         if ckpt['optimizer'] is not None:
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
+            best_fitness = 1e-5
 
         # load results
         if ckpt.get('training_results') is not None:
@@ -180,7 +182,7 @@ def train(hyp):
     model.hyp = hyp  # attach hyperparameters to model
     model.gr = 1.0  # giou loss ratio (obj_loss = 1.0 or giou)
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
-
+    model.module_list = model.module.module_list
     # Model EMA
     ema = torch_utils.ModelEMA(model)
 
@@ -247,7 +249,7 @@ def train(hyp):
             idx2mask = None
             # if opt.sr and opt.prune==1 and epoch > opt.epochs * 0.5:
             #     idx2mask = get_mask2(model, prune_idx, 0.85)
-            from utils.prune_utils import BNOptimizer
+
             BNOptimizer.updateBN(opt.sr_flag, model.module_list, opt.gamma, prune_idx, idx2mask)
             if ni % accumulate == 0:
                 optimizer.step()
@@ -277,7 +279,7 @@ def train(hyp):
         if not opt.notest or final_epoch:  # Calculate mAP
             results, maps, times = test.test(cfg=opt.cfg,
                                              names_file=opt.names_classes,
-                                             batch_size=16,
+                                             batch_size=8,
                                              img_size=opt.input_size,
                                              conf_thres=0.01,
                                              save_json=False,
@@ -299,7 +301,8 @@ def train(hyp):
                     'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
             for x, tag in zip(list(mloss[:-1]) + list(results), tags):
                 tb_writer.add_scalar(tag, x, epoch)
-
+            bn_weights = gather_bn_weights(model.module_list, prune_idx)
+            tb_writer.add_histogram('bn_weights/hist', bn_weights.numpy(), epoch, bins='doane')
         # Update best mAP
         fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
         if fi > best_fitness:
@@ -350,13 +353,13 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=8)  # effective bs = batch_size * accumulate = 16 * 4 = 64
     parser.add_argument('--input_size', nargs='+', type=int, default=608, help='[min_train, max-train, test]')
     parser.add_argument('--algorithm_type', default="v4", help='algorithm_type yolov3 v4 v5')
-    parser.add_argument('--device', default='0,1', help='device id (i.e. 0 or 0,1 or cpu)')
+    parser.add_argument('--device', default='4,5', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--cfg', type=str, default='cfg/yolov4.cfg', help='*.cfg path')
-    parser.add_argument('--train_path', type=str, default='data/train2017_txt_dataset.txt', help='*.data path')
-    parser.add_argument('--val_path', type=str, default='data/val2017_txt_dataset.txt', help='*.data path')
+    parser.add_argument('--train_path', type=str, default='data/train.txt', help='*.data path')
+    parser.add_argument('--val_path', type=str, default='data/val.txt', help='*.data path')
     parser.add_argument('--names_classes', type=str, default='data/coco.names', help='*.data path')
     parser.add_argument('--multi_scale', default=True, help='adjust (67%% - 150%%) img_size every 10 batches')
-    parser.add_argument('--weights', type=str, default='weights/yolov4.weights', help='initial weights path')
+    parser.add_argument('--weights', type=str, default='weights/last_voc_slim.pt', help='initial weights path')
     parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
     parser.add_argument('--sr_flag', default=True, help='prune flag')
     parser.add_argument('--gamma', type=float, default=1e-4, help='prune flag')

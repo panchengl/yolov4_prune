@@ -4,7 +4,7 @@ import torch.distributed as dist
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.tensorboard import SummaryWriter
-from utils.loss import compute_loss
+from utils.loss import compute_loss, distillation_loss1, distillation_loss2
 import test  # import test.py to get mAP after each epoch
 from model import *
 from utils.util import *
@@ -18,8 +18,8 @@ except:
     mixed_precision = False  # not installed
 
 wdir = 'weights' + os.sep  # weights dir
-last = wdir + 'last.pt'
-best = wdir + 'best.pt'
+last = wdir + 'last_prune_voc.pt'
+best = wdir + 'best_prune_voc.pt'
 results_file = 'results.txt'
 
 # Hyperparameters
@@ -42,6 +42,26 @@ hyp = {'giou': 3.54,  # giou loss gain
        'scale': 0.05 * 0,  # image scale (+/- gain)
        'shear': 0.641 * 0}  # image shear (+/- deg)
 
+# hyp = {'optimizer': 'SGD',  # ['adam', 'SGD', None] if none, default is SGD
+#        'lr0': 0.01,  # initial learning rate (SGD=1E-2, Adam=1E-3)
+#        'momentum': 0.937,  # SGD momentum/Adam beta1
+#        'weight_decay': 5e-4,  # optimizer weight decay
+#        'giou': 0.05,  # giou loss gain
+#        'cls': 0.5,  # cls loss gain
+#        'cls_pw': 1.0,  # cls BCELoss positive_weight
+#        'obj': 1.0,  # obj loss gain (*=img_size/320 if img_size != 320)
+#        'obj_pw': 1.0,  # obj BCELoss positive_weight
+#        'iou_t': 0.20,  # iou training threshold
+#        'anchor_t': 4.0,  # anchor-multiple threshold
+#        'fl_gamma': 0.0,  # focal loss gamma (efficientDet default is gamma=1.5)
+#        'hsv_h': 0.015,  # image HSV-Hue augmentation (fraction)
+#        'hsv_s': 0.7,  # image HSV-Saturation augmentation (fraction)
+#        'hsv_v': 0.4,  # image HSV-Value augmentation (fraction)
+#        'degrees': 0.0,  # image rotation (+/- deg)
+#        'translate': 0.0,  # image translation (+/- fraction)
+#        'scale': 0.5,  # image scale (+/- gain)
+#        'shear': 0.0}  # image shear (+/- deg)
+
 # Overwrite hyp with hyp*.txt (optional)
 f = glob.glob('hyp*.txt')
 if f:
@@ -56,6 +76,8 @@ if hyp['fl_gamma']:
 
 def train(hyp):
     cfg = opt.cfg
+    t_cfg = opt.t_cfg
+    t_weights = opt.t_weights
     # data = opt.data
     epochs = opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
     batch_size = opt.batch_size
@@ -74,6 +96,11 @@ def train(hyp):
 
     # Initialize model
     model = Darknet(opt.cfg, opt.input_size, opt.algorithm_type).to(device)
+    # if opt.t_cfg:
+    #     assert (opt.t_cfg and opt.t_weights)
+    #     print("warming: this model will use teacher model distill to student model, will use more gpu memory")
+    #     t_model = Darknet(opt.t_cfg, opt.input_size, opt.algorithm_type).to(device)
+
     # Optimizer
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in dict(model.named_parameters()).items():
@@ -134,6 +161,18 @@ def train(hyp):
         # possible weights are '*.weights', 'yolov3-tiny.conv.15',  'darknet53.conv.74' etc.
         load_darknet_weights(model, weights)
 
+    # if t_cfg:
+    #     if t_weights.endswith('.pt'):
+    #         t_model.load_state_dict(torch.load(t_weights, map_location=device)['model'].state_dict())
+    #     elif t_weights.endswith('.weights'):
+    #         load_darknet_weights(t_model, t_weights)
+    #     else:
+    #         raise Exception('pls provide proper teacher weights for knowledge distillation')
+    #     # if not mixed_precision:
+    #     #     t_model.eval()
+    #     print('<.....................using knowledge distillation.......................>')
+    #     print('teacher model:', t_weights, '\n')
+
     if opt.freeze_layers:
         output_layer_indices = [idx - 1 for idx, module in enumerate(model.module_list) if isinstance(module, YOLOLayer)]
         freeze_layer_indices = [x for x in range(len(model.module_list)) if
@@ -188,7 +227,6 @@ def train(hyp):
 
     # Model EMA
     ema = torch_utils.ModelEMA(model)
-
     # Start training
     nb = len(dataloader)  # number of batches
     n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
@@ -208,7 +246,10 @@ def train(hyp):
             dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # rand weighted idx
 
         mloss = torch.zeros(4).to(device)  # mean losses
-        print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        msoft_target = torch.zeros(1).to(device)
+        # print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        print(('\n' + '%10s' * 10) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'soft', 'rratio', 'targets', 'img_size'))
+
         pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
         # for i, (imgs, targets, paths, _) in enumerate(dataloader):  # batch -------------------------------------------------------------
@@ -243,6 +284,23 @@ def train(hyp):
                 return results
             # Backward
             loss *= batch_size / 64  # scale loss
+
+            soft_target = 0
+            reg_ratio = 0  # 表示有多少target的回归是不如老师的，这时学生会跟gt再学习
+            # if t_cfg:
+            #     if mixed_precision:
+            #         with torch.no_grad():
+            #             output_t = t_model(imgs)
+            #     else:
+            #         output_t = t_model(imgs)
+            #         for i, j in enumerate(pred):
+            #             print("pred shape is", j.shape)
+            #             print("output_t shape is",output_t[i].shape)
+            #         soft_target = distillation_loss1(pred, output_t, model.nc, imgs.size(0))
+            #         # 这里把蒸馏策略改为了二，想换回一的可以注释掉loss2，把loss1取消注释
+            #         # soft_target, reg_ratio = distillation_loss2(model, targets, pred, output_t)
+            #         loss += soft_target
+
             if mixed_precision:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
@@ -257,7 +315,9 @@ def train(hyp):
             # Print
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
             mem = '%.3gG' % (torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-            s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), imgs.shape[-1])
+            msoft_target = (msoft_target * i + soft_target) / (i + 1)
+            s = ('%10s' * 2 + '%10.3g' * 8) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, msoft_target, reg_ratio,len(targets), imgs.shape[-1])
+            # s = ('%10s' * 2 + '%10.3g' * 8) % ('%g/%g' % (epoch, epochs - 1), '%.3gG' % mem, *mloss, msoft_target, reg_ratio, len(targets), imgs.shape[-1])
             pbar.set_description(s)
 
             # Plot
@@ -277,10 +337,10 @@ def train(hyp):
         if not opt.notest or final_epoch:  # Calculate mAP
             results, maps, times = test.test(cfg=opt.cfg,
                                              names_file=opt.names_classes,
-                                             batch_size=16,
+                                             conf_thres=0.3,
+                                             save_json=False,                                             batch_size=16,
                                              img_size=opt.input_size,
-                                             conf_thres=0.01,
-                                             save_json=False,
+
                                              # model=ema.ema.module if hasattr(ema.ema, 'module') else ema.ema,
                                              model= ema.ema,
                                              single_cls=False,
@@ -351,14 +411,18 @@ if __name__ == '__main__':
     parser.add_argument('--input_size', nargs='+', type=int, default=608, help='[min_train, max-train, test]')
     parser.add_argument('--algorithm_type', default="v4", help='algorithm_type yolov3 v4 v5')
     parser.add_argument('--device', default='4,5', help='device id (i.e. 0 or 0,1 or cpu)')
-    parser.add_argument('--cfg', type=str, default='cfg/yolov4.cfg', help='*.cfg path')
-    parser.add_argument('--train_path', type=str, default='data/train2017_txt_dataset.txt', help='*.data path')
-    parser.add_argument('--val_path', type=str, default='data/val2017_txt_dataset.txt', help='*.data path')
+    parser.add_argument('--cfg', type=str, default='cfg/prune_0.4_keep_0.01_yolov4.cfg', help='*.cfg path')
+    # parser.add_argument('--cfg', type=str, default='cfg/prune_0.5_keep_0.01_yolov4.cfg', help='*.cfg path')
+    parser.add_argument('--train_path', type=str, default='data/train.txt', help='*.data path')
+    parser.add_argument('--val_path', type=str, default='data/val.txt', help='*.data path')
     parser.add_argument('--names_classes', type=str, default='data/coco.names', help='*.data path')
     parser.add_argument('--multi_scale', default= True, help='adjust (67%% - 150%%) img_size every 10 batches')
-    parser.add_argument('--weights', type=str, default='weights/yolov4.weights', help='initial weights path')
+    parser.add_argument('--weights', type=str, default='weights/prune_0.4_keep_0.01_last_voc_slim.weights', help='initial weights path')
     parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
 
+    parser.add_argument('--t_cfg', type=str, default="cfg/yolov4.cfg", help='*.cfg path')
+    parser.add_argument('--t_weights', type=str, default="weights/best_prune_voc_conf03_ap755.pt",
+                        help='initial weights path')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')

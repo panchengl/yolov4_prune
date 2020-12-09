@@ -10,6 +10,7 @@ from model import *
 from utils.util import *
 from utils.torch_utils import select_device
 from utils.dataset import create_dataloader
+from torch.cuda import amp
 mixed_precision = True
 try:  # Mixed precision training https://github.com/NVIDIA/apex
     from apex import amp
@@ -23,24 +24,44 @@ best = wdir + 'best.pt'
 results_file = 'results.txt'
 
 # Hyperparameters
-hyp = {'giou': 3.54,  # giou loss gain
-       'cls': 37.4,  # cls loss gain
+# hyp = {'giou': 3.54,  # giou loss gain
+#        'cls': 37.4,  # cls loss gain
+#        'cls_pw': 1.0,  # cls BCELoss positive_weight
+#        'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
+#        'obj_pw': 1.0,  # obj BCELoss positive_weight
+#        'iou_t': 0.20,  # iou training threshold
+#        'lr0': 0.01,  # initial learning rate (SGD=5E-3, Adam=5E-4)
+#        'lrf': 0.0005,  # final learning rate (with cos scheduler)
+#        'momentum': 0.937,  # SGD momentum
+#        'weight_decay': 0.0005,  # optimizer weight decay
+#        'fl_gamma': 0.0,  # focal loss gamma (efficientDet default is gamma=1.5)
+#        'hsv_h': 0.0138,  # image HSV-Hue augmentation (fraction)
+#        'hsv_s': 0.678,  # image HSV-Saturation augmentation (fraction)
+#        'hsv_v': 0.36,  # image HSV-Value augmentation (fraction)
+#        'degrees': 1.98 * 0,  # image rotation (+/- deg)
+#        'translate': 0.05 * 0,  # image translation (+/- fraction)
+#        'scale': 0.05 * 0,  # image scale (+/- gain)
+#        'shear': 0.641 * 0}  # image shear (+/- deg)
+
+hyp = {'optimizer': 'SGD',  # ['adam', 'SGD', None] if none, default is SGD
+       'lr0': 0.01,  # initial learning rate (SGD=1E-2, Adam=1E-3)
+       'momentum': 0.937,  # SGD momentum/Adam beta1
+       'weight_decay': 5e-4,  # optimizer weight decay
+       'giou': 0.05,  # giou loss gain
+       'cls': 0.5,  # cls loss gain
        'cls_pw': 1.0,  # cls BCELoss positive_weight
-       'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
+       'obj': 1.0,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
        'iou_t': 0.20,  # iou training threshold
-       'lr0': 0.01,  # initial learning rate (SGD=5E-3, Adam=5E-4)
-       'lrf': 0.0005,  # final learning rate (with cos scheduler)
-       'momentum': 0.937,  # SGD momentum
-       'weight_decay': 0.0005,  # optimizer weight decay
+       'anchor_t': 4.0,  # anchor-multiple threshold
        'fl_gamma': 0.0,  # focal loss gamma (efficientDet default is gamma=1.5)
-       'hsv_h': 0.0138,  # image HSV-Hue augmentation (fraction)
-       'hsv_s': 0.678,  # image HSV-Saturation augmentation (fraction)
-       'hsv_v': 0.36,  # image HSV-Value augmentation (fraction)
-       'degrees': 1.98 * 0,  # image rotation (+/- deg)
-       'translate': 0.05 * 0,  # image translation (+/- fraction)
-       'scale': 0.05 * 0,  # image scale (+/- gain)
-       'shear': 0.641 * 0}  # image shear (+/- deg)
+       'hsv_h': 0.015,  # image HSV-Hue augmentation (fraction)
+       'hsv_s': 0.7,  # image HSV-Saturation augmentation (fraction)
+       'hsv_v': 0.4,  # image HSV-Value augmentation (fraction)
+       'degrees': 0.0,  # image rotation (+/- deg)
+       'translate': 0.0,  # image translation (+/- fraction)
+       'scale': 0.5,  # image scale (+/- gain)
+       'shear': 0.0}  # image shear (+/- deg)
 
 # Overwrite hyp with hyp*.txt (optional)
 f = glob.glob('hyp*.txt')
@@ -70,11 +91,15 @@ def train(hyp):
     hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
 
     # Remove previous results
-    for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):
-        os.remove(f)
-
+    try:
+        for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):
+            os.remove(f)
+        print("success remove last train_batch*.jpg")
+    except:
+        print("no last train_-batch*.jpg")
     # Initialize model
     model = Darknet(opt.cfg, opt.input_size, opt.algorithm_type).to(device)
+    cuda = device.type != 'cpu'
     # Optimizer
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in dict(model.named_parameters()).items():
@@ -152,6 +177,7 @@ def train(hyp):
     lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * 0.95 + 0.05  # cosine
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     scheduler.last_epoch = start_epoch - 1  # see link below
+    scaler = amp.GradScaler(enabled=cuda)
     # https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822
 
     # Plot lr schedule
@@ -176,7 +202,8 @@ def train(hyp):
     # model.module_list = model.module.module_list
     print("rank is", opt.global_rank)
     ema = torch_utils.ModelEMA(model) if rank in [-1, 0] else None
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[opt.local_rank], output_device=(opt.local_rank))
+    if rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[opt.local_rank], output_device=(opt.local_rank))
     model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
     dataloader, dataset = create_dataloader(opt.train_path, opt.input_size, batch_size, gs, hyp=hyp,
                                            augment=True,
@@ -266,14 +293,17 @@ def train(hyp):
                 print('WARNING: non-finite loss, ending training ', loss_items)
                 return results
             # Backward
-            loss *= batch_size / 64  # scale loss
-            if mixed_precision:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            # loss *= batch_size / 64  # scale loss
+            # if mixed_precision:
+            #     with amp.scale_loss(loss, optimizer) as scaled_loss:
+            #         scaled_loss.backward()
+            # else:
+            #     loss.backward()
             # Optimize
+            scaler.scale(loss).backward()
             if ni % accumulate == 0:
+                scaler.step(optimizer)  # optimizer.step
+                scaler.update()
                 optimizer.step()
                 optimizer.zero_grad()
                 # ema.update(model)
@@ -400,7 +430,7 @@ if __name__ == '__main__':
     opt = parser.parse_args()
     print("opt.local_rank is", opt.local_rank)
     opt.weights = last if opt.resume and not opt.weights else opt.weights
-    check_git_status()
+    # check_git_status()
     opt.cfg = check_file(opt.cfg)  # check file
     opt.data = check_file(opt.train_path)  # check file
     opt.data = check_file(opt.val_path)  # check file
