@@ -1,3 +1,19 @@
+20210106 updates:
+
+    add block prune and soft prune in channels at the same time, in order to get the maximum compression rate, but it not work.
+
+    In my experiment, every csp blcok is very important and cannot be deleted. Every time soft-prune is used, the precision drops a lot, and the final precision loss is very serious.
+
+        paper reference: Soft Filter Pruning for Accelerating Deep Convolutional Neural Networks
+
+        paper reference: Data-Driven Sparse Structure Selection for Deep Neural Networks
+
+    all this paper is auto prune, maybe i can use iterative prune to use this way,
+
+    *********Recently, I found a bug that if you use sliming method to prune, once you quantify the model, it is very likely that there will be a big loss of accuracy
+
+    *********Note that this is related to the pruning principle of bn layer. It is best not to use this method when quantization is needed. If it is used, it is best to truncate the parameters of bn
+
 20201128 updates:
 
     I want to duplicate the yolo algorithm based on my own ideas, and structed prune yolo use pytorch, if you agree with my work, thank u to give me a star to support
