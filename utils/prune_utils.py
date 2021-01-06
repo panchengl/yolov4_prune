@@ -328,3 +328,183 @@ def prune_model_keep_size2(model, prune_idx, CBL_idx, CBLidx2mask):
                 activations.append(activation)
 
     return pruned_model
+
+def gather_l1_weights_channels(module_list, prune_idx):
+
+    size_list = [module_list[idx][0].weight.data.shape[0]  for idx in prune_idx]
+    l1_weights = torch.zeros(sum(size_list))
+    index = 0
+    for idx, size in zip(prune_idx, size_list):
+        C, N, H, W = module_list[idx][0].weight.data.shape
+        channels_weights = torch.reshape(module_list[idx][0].weight.data.abs(), (C, -1))
+        channels_weights_sum = torch.sum(channels_weights, dim=1)/(N*H*W)
+        # print('channels_weights_sum is', channels_weights_sum)
+        # print('channels_weights_sum is', channels_weights_sum.shape)
+        l1_weights[index:(index + size)] = channels_weights_sum
+        index += size
+
+    return l1_weights
+
+def gather_l2_weights_channels(module_list, prune_idx):
+    size_list = [module_list[idx][0].weight.data.shape[0] for idx in prune_idx]
+    l2_weights = torch.zeros(sum(size_list))
+    index = 0
+    for idx, size in zip(prune_idx, size_list):
+        C, N, H, W = module_list[idx][0].weight.data.shape
+        # print("module_list[idx][0].weight.data.shape is", module_list[idx][0].weight.data.shape)
+        channels_weights = module_list[idx][0].weight.data.view(module_list[idx][0].weight.data.size()[0], -1)
+        channels_l2_weights = torch.norm(channels_weights, 2, 1)/(H*W*N)
+        # channels_l2_weights_sum = torch.sum(channels_l2_weights, dim=-1)/(H*W*N)
+        # print('channels_l2_weights_sum is', channels_l2_weights)
+        l2_weights[index:(index + size)] = channels_l2_weights
+        index += size
+    return l2_weights
+
+def get_global_norm_thr(model, prune_idx, global_percent, norm_type="l2"):
+    if norm_type == "l1":
+        norm_weights = gather_l1_weights_channels(model.module_list, prune_idx)
+    elif norm_type== "l2":
+        norm_weights = gather_l2_weights_channels(model.module_list, prune_idx)
+    sorted_l2, sorted_l2_index = torch.sort(norm_weights)
+    thresh_index_norm = int(len(norm_weights)*global_percent)
+    thresh_norm = sorted_l2[thresh_index_norm].cuda()
+    return thresh_norm
+
+def get_layer_norm_thr(model, prune_idx, layer_percent, norm_type="l2"):
+    size_list = [model.module_list[idx][0].weight.data.shape[0] for idx in prune_idx]
+    layer_thr_list = []
+    layer_prune_index = []
+    for idx, size in zip(prune_idx, size_list):
+        C, N, H, W = model.module_list[idx][0].weight.data.shape
+        channels_weights = model.module_list[idx][0].weight.data.view(model.module_list[idx][0].weight.data.size()[0], -1)
+        channels_l2_weights = torch.norm(channels_weights, 2, 1)
+        thr_index = int(len(channels_l2_weights.cpu().numpy().tolist())*layer_percent)
+        sort_weights, sort_index = torch.sort(channels_l2_weights)
+        thr = sort_weights[thr_index]
+        layer_thr_list.append(thr)
+        layer_prune_index.append(sort_index[:thr_index])
+        # print("thr_index is", sort_index[:thr_index])
+        # raise ValueError("stop")
+    return layer_thr_list, layer_prune_index
+
+def obtain_filters_mask_norm(model, thre, CBL_idx, prune_idx, layer_keep, norm_type="l2"):
+    pruned = 0
+    total = 0
+    num_filters = []
+    filters_mask = []
+    for idx in CBL_idx:
+        bn_module = model.module_list[idx][1]
+        if idx in prune_idx:
+            channels, N, H, W = model.module_list[idx][0].weight.data.shape
+            min_channel_num = int(channels * layer_keep) if int(channels * layer_keep) > 0 else 1
+            # print("nb_of_clusters is", min_channel_num)
+            if norm_type == "l1":
+                weight_copy_sum = torch.sum(torch.reshape(model.module_list[idx][0].weight.data.abs(), (channels, -1)), dim=1) / (N * H * W)
+            elif norm_type == "l2":
+                weight_copy_sum = torch.norm(model.module_list[idx][0].weight.data.view(channels, -1), 2, 1) / ( H * W * N)
+            else:
+                raise ValueError("norm type is illegal")
+            # print("weight_copy_sum is", weight_copy_sum)
+            mask = weight_copy_sum.gt(thre).float()
+            if int(torch.sum(mask)) < min_channel_num:
+                _, sorted_index_weights = torch.sort(weight_copy_sum, descending=True)
+                mask[sorted_index_weights[:min_channel_num]] = 1.
+            # print("at last mask is", mask)
+            remain = int(mask.sum())
+            pruned = pruned + mask.shape[0] - remain
+
+            print(f'layer index: {idx:>3d} \t total channel: {mask.shape[0]:>4d} \t '
+                  f'remaining channel: {remain:>4d}')
+        else:
+            mask = torch.ones(bn_module.weight.data.shape)
+            remain = mask.shape[0]
+            print(f'not prune layer info:  layer index: {idx:>3d} \t total channel: {mask.shape[0]:>4d} \t '
+                  f'remaining channel: {remain:>4d}')
+        total += mask.shape[0]
+        num_filters.append(remain)
+        filters_mask.append(mask.clone())
+    prune_ratio = pruned / total
+    print(f'Prune channels: {pruned}\tPrune ratio: {prune_ratio:.3f}')
+    return num_filters, filters_mask
+
+
+def obtain_filters_mask_norm_per_layer(model, thre_list, CBL_idx, prune_idx, layer_keep, norm_type="l2"):
+    pruned = 0
+    total = 0
+    num_filters = []
+    filters_mask = []
+    thre_id = 0
+    for idx in CBL_idx:
+        bn_module = model.module_list[idx][1]
+        if idx in prune_idx:
+            thre = thre_list[thre_id]
+            thre_id += 1
+            # print("this layer thr is", thre)
+            channels, N, H, W = model.module_list[idx][0].weight.data.shape
+            min_channel_num = int(channels * layer_keep) if int(channels * layer_keep) > 0 else 1
+            # print("nb_of_clusters is", min_channel_num)
+            if norm_type == "l1":
+                weight_copy_sum = torch.sum(torch.reshape(model.module_list[idx][0].weight.data.abs(), (channels, -1)), dim=1)
+            elif norm_type == "l2":
+                weight_copy_sum = torch.norm(model.module_list[idx][0].weight.data.view(channels, -1), 2, 1)
+            else:
+                raise ValueError("norm type is illegal")
+            # print("weight_copy_sum is", weight_copy_sum)
+            mask = weight_copy_sum.gt(thre).float()
+            if int(torch.sum(mask)) < min_channel_num:
+                _, sorted_index_weights = torch.sort(weight_copy_sum, descending=True)
+                mask[sorted_index_weights[:min_channel_num]] = 1.
+            # print("at last mask is", mask)
+            remain = int(mask.sum())
+            pruned = pruned + mask.shape[0] - remain
+
+            print(f'layer index: {idx:>3d} \t total channel: {mask.shape[0]:>4d} \t '
+                  f'remaining channel: {remain:>4d}')
+            # raise  ValueError("stop")
+        else:
+            mask = torch.ones(bn_module.weight.data.shape)
+            remain = mask.shape[0]
+            print(f'not prune layer info:  layer index: {idx:>3d} \t total channel: {mask.shape[0]:>4d} \t '
+                  f'remaining channel: {remain:>4d}')
+        total += mask.shape[0]
+        num_filters.append(remain)
+        filters_mask.append(mask.clone())
+    prune_ratio = pruned / total
+    print(f'Prune channels: {pruned}\tPrune ratio: {prune_ratio:.3f}')
+    return num_filters, filters_mask
+
+def prune_soft_model(model, CBL_idx, CBLidx2mask):
+    # model_copy = deepcopy(model)
+    # model_copy = model
+    for idx in CBL_idx:
+        conv_model = model.module_list[idx][0]
+        mask = CBLidx2mask[idx].cuda()
+        weight_torch = conv_model.weight.data
+        c, n, h, w = weight_torch.shape
+        a = conv_model.weight.data.view(-1)
+        kernel_length =n*h*w
+        for id, x in enumerate(mask):
+            a[id*kernel_length:(id+1)*kernel_length] *= x
+        conv_model.weight.data =a.view(c, n, h ,w)
+
+def prune_soft_model_code(model, CBL_idx, CBLidx2mask):
+    for idx in CBL_idx:
+        conv_model = model.module_list[idx][0]
+        mask = CBLidx2mask[idx].cuda()
+        weight_torch = conv_model.weight.data
+        # print("before conv_model.weight.data is", conv_model.weight.data)
+        if len(weight_torch.size()) == 4:
+            c, n, h, w = weight_torch.shape
+            weight_vec = conv_model.weight.data.view(-1)
+            kernel_length =n*h*w
+            for id, x in enumerate(mask):
+                weight_vec[id*kernel_length:(id+1)*kernel_length] *= x
+            conv_model.weight.data =weight_vec.view(c, n, h ,w)
+        else:
+            raise ValueError("this prune id {} is not conv type, please check prune id list ".format(idx))
+
+
+
+
+
+
